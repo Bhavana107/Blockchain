@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/// @notice Demo-only ERC-20-like token. Never use for real funds.
+/// @notice Demo-only ERC-20 token. Never use for real funds.
 contract MockUSDC {
     string public name="PayGuard Test Dollar";
     string public symbol="pUSD";
-    uint8 public decimals=6;
+    uint8 public constant decimals=6;
     uint256 public totalSupply;
     address public owner;
     mapping(address=>uint256) public balanceOf;
@@ -16,20 +16,28 @@ contract MockUSDC {
 
     constructor(){owner=msg.sender;}
     modifier onlyOwner(){if(msg.sender!=owner) revert NotOwner();_;}
+
     function mint(address to,uint256 amount) external onlyOwner {
         if(to==address(0)) revert ZeroAddress();
+        if(amount==0) revert InsufficientBalance();
         totalSupply+=amount; balanceOf[to]+=amount; emit Transfer(address(0),to,amount);
     }
+
     function approve(address spender,uint256 amount) external returns(bool){
+        if(spender==address(0)) revert ZeroAddress();
         allowance[msg.sender][spender]=amount; emit Approval(msg.sender,spender,amount); return true;
     }
+
     function transfer(address to,uint256 amount) external returns(bool){_transfer(msg.sender,to,amount);return true;}
+
     function transferFrom(address from,address to,uint256 amount) external returns(bool){
+        if(from==address(0)||to==address(0)) revert ZeroAddress();
         uint256 allowed=allowance[from][msg.sender];
         if(allowed<amount) revert InsufficientAllowance();
         if(allowed!=type(uint256).max) allowance[from][msg.sender]=allowed-amount;
         _transfer(from,to,amount); return true;
     }
+
     function _transfer(address from,address to,uint256 amount) internal {
         if(to==address(0)) revert ZeroAddress();
         if(balanceOf[from]<amount) revert InsufficientBalance();

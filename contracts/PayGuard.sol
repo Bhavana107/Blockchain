@@ -17,6 +17,7 @@ contract PayGuard is ReentrancyGuard {
 
     uint8 public constant REQUIRED_APPROVALS = 2;
     uint8 public constant SIGNER_COUNT = 3;
+    uint256 public constant MIN_PAYMENT_DURATION = 10 minutes;
     uint256 public constant MAX_PAYMENT_DURATION = 30 days;
     uint256 public constant MAX_PRICE_AGE = 1 days;
 
@@ -41,7 +42,7 @@ contract PayGuard is ReentrancyGuard {
     event PaymentCreated(uint256 indexed paymentId,address indexed payer,address indexed merchant,uint256 amount,uint64 deadline);
     event PaymentApproved(uint256 indexed paymentId,address indexed signer,uint8 approvalCount);
     event PaymentReleased(uint256 indexed paymentId,address indexed merchant,uint256 amount);
-    event PaymentRefunded(uint256 indexed paymentId,address indexed payer,uint256 amount);
+    event PaymentRefunded(uint256 indexed paymentId,address indexed payer,uint256 amount,uint256 refundedAt);
 
     error ZeroAddress();
     error InvalidSigners();
@@ -52,12 +53,13 @@ contract PayGuard is ReentrancyGuard {
     error PaymentAlreadyFinalized();
     error ApprovalWindowClosed();
     error AlreadyApproved();
-    error NotPayer();
     error DeadlineNotPassed();
     error InvalidPrice();
+    error TokenTransferFailed();
 
     constructor(address tokenAddress,address feedAddress,address[3] memory initialSigners) {
         if(tokenAddress==address(0)||feedAddress==address(0)) revert ZeroAddress();
+        if(tokenAddress==address(this)) revert InvalidSigners();
         for(uint256 i=0;i<SIGNER_COUNT;i++){
             if(initialSigners[i]==address(0)) revert InvalidSigners();
             for(uint256 j=i+1;j<SIGNER_COUNT;j++){
@@ -76,16 +78,24 @@ contract PayGuard is ReentrancyGuard {
         _;
     }
 
+    /// @notice Escrow `amount` tokens until `deadline`. Payer must have approved this contract.
     function createPayment(address merchant,uint256 amount,uint64 deadline) external nonReentrant returns(uint256 paymentId){
-        if(merchant==address(0)) revert ZeroAddress();
+        if(merchant==address(0)||merchant==msg.sender) revert ZeroAddress();
         if(amount==0) revert InvalidAmount();
-        if(deadline<=block.timestamp||deadline>block.timestamp+MAX_PAYMENT_DURATION) revert InvalidDeadline();
-        paymentId=nextPaymentId++;
-        payments[paymentId]=Payment(msg.sender,merchant,amount,deadline,0,false,false);
+        if(deadline<=block.timestamp) revert InvalidDeadline();
+        uint256 duration=deadline-block.timestamp;
+        if(duration<MIN_PAYMENT_DURATION||duration>MAX_PAYMENT_DURATION) revert InvalidDeadline();
+
+        // Pull funds first (reverts atomically on failure), then record state.
         paymentToken.safeTransferFrom(msg.sender,address(this),amount);
+
+        paymentId=nextPaymentId;
+        payments[paymentId]=Payment(msg.sender,merchant,amount,deadline,0,false,false);
+        nextPaymentId=paymentId+1;
         emit PaymentCreated(paymentId,msg.sender,merchant,amount,deadline);
     }
 
+    /// @notice Signer approves a pending payment; 2 approvals release funds to the merchant.
     function approvePayment(uint256 paymentId) external onlySigner nonReentrant {
         Payment storage p=payments[paymentId];
         if(p.payer==address(0)) revert PaymentNotFound();
@@ -102,15 +112,16 @@ contract PayGuard is ReentrancyGuard {
         }
     }
 
+    /// @notice After the deadline passes with no release, anyone may trigger the refund
+    ///         (payer, merchant or an arbiter) so funds never get stuck if the payer is inactive.
     function refundExpired(uint256 paymentId) external nonReentrant {
         Payment storage p=payments[paymentId];
         if(p.payer==address(0)) revert PaymentNotFound();
-        if(msg.sender!=p.payer) revert NotPayer();
         if(p.released||p.refunded) revert PaymentAlreadyFinalized();
         if(block.timestamp<=p.deadline) revert DeadlineNotPassed();
         p.refunded=true;
         paymentToken.safeTransfer(p.payer,p.amount);
-        emit PaymentRefunded(paymentId,p.payer,p.amount);
+        emit PaymentRefunded(paymentId,p.payer,p.amount,block.timestamp);
     }
 
     function getPayment(uint256 paymentId) external view returns(Payment memory){
@@ -119,9 +130,12 @@ contract PayGuard is ReentrancyGuard {
         return p;
     }
 
+    function getSigners() external view returns(address[3] memory){ return signers; }
+
+    /// @dev Returns a validated, fresh ETH/USD price. Reverts if stale, negative or zero.
     function getLatestEthUsdPrice() external view returns(int256 price,uint8 feedDecimals,uint256 updatedAt){
         (,price,,updatedAt,)=ethUsdFeed.latestRoundData();
         feedDecimals=ethUsdFeed.decimals();
-        if(price<=0||updatedAt==0||updatedAt>block.timestamp||block.timestamp-updatedAt>MAX_PRICE_AGE) revert InvalidPrice();
+        if(price<=0||updatedAt==0||updatedAt>block.timestamp+1 hours||block.timestamp-updatedAt>MAX_PRICE_AGE) revert InvalidPrice();
     }
 }
